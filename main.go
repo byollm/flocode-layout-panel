@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	tea "github.com/charmbracelet/bubbletea"
@@ -47,6 +49,12 @@ const (
 	modeToggles
 )
 
+type tickMsg struct{}
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Second/18, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
 type model struct {
 	panels  []*panel
 	preset  int
@@ -57,6 +65,7 @@ type model struct {
 	names   []string // preset names
 	presets [][]string
 	saved   int
+	frame   int // animation frame counter
 }
 
 var presetDefs = []struct {
@@ -154,10 +163,13 @@ func (m *model) active() []*panel {
 	return out
 }
 
-func (m *model) Init() tea.Cmd { return nil }
+func (m *model) Init() tea.Cmd { return tickCmd() }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tickMsg:
+		m.frame++
+		return m, tickCmd()
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -320,11 +332,73 @@ func (m *model) togglesView() string {
 	return b.String()
 }
 
+// gradientHeader renders the title as a traveling rainbow gradient whose
+// phase advances with the frame counter.
+func (m *model) gradientHeader(title string) string {
+	palette := []lipgloss.Color{cHeader, cAccent, cSuccess, cFocus, cText}
+	centered := center(title, m.width)
+	runes := []rune(centered)
+	var b strings.Builder
+	for i, r := range runes {
+		c := palette[(i+m.frame)%len(palette)]
+		b.WriteString(lipgloss.NewStyle().Foreground(c).Bold(true).Render(string(r)))
+	}
+	return b.String()
+}
+
+// pulse interpolates between two colors over a sine-like cycle.
+func pulse(frame int, period int) float64 {
+	ph := float64(frame%period) / float64(period) * 2 * math.Pi
+	return (1 + math.Sin(ph)) / 2 // 0..1
+}
+
+// focusStyle returns the body style for a focused panel, breathing between
+// lavender and white.
+func focusStyle(frame int) lipgloss.Style {
+	t := pulse(frame, 36)
+	c := lerpColor(cFocus, lipgloss.Color("#ffffff"), t)
+	return lipgloss.NewStyle().Foreground(c).Bold(true)
+}
+
+// lerpColor linearly interpolates two hex colors.
+func lerpColor(a, b lipgloss.Color, t float64) lipgloss.Color {
+	pa, pb := hexToRGB(string(a)), hexToRGB(string(b))
+	r := uint8(float64(pa[0]) + t*(float64(pb[0])-float64(pa[0])))
+	g := uint8(float64(pa[1]) + t*(float64(pb[1])-float64(pa[1])))
+	bch := uint8(float64(pa[2]) + t*(float64(pb[2])-float64(pa[2])))
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", r, g, bch))
+}
+
+func hexToRGB(h string) [3]int {
+	var r, g, b int
+	fmt.Sscanf(h, "#%02x%02x%02x", &r, &g, &b)
+	return [3]int{r, g, b}
+}
+
+// shimmerFill produces a moving highlight band across the panel body text.
+func shimmerFill(fill string, w, frame int) string {
+	s := center(fill, w)
+	runes := []rune(s)
+	pos := frame % (w + 8)
+	var b strings.Builder
+	for i, r := range runes {
+		d := pos - i
+		if d >= 0 && d < 5 {
+			// bright band trailing off
+			c := lerpColor(cText, lipgloss.Color("#ffffff"), 1-float64(d)/5)
+			b.WriteString(lipgloss.NewStyle().Foreground(c).Render(string(r)))
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func (m *model) render() []string {
 	act := m.active()
 	var lines []string
 	title := fmt.Sprintf("flocode — %s", m.names[m.preset])
-	lines = append(lines, styDim.Render(strings.Repeat("▔", m.width)), styHeader.Render(center(title, m.width)), styDim.Render(strings.Repeat("▔", m.width)))
+	lines = append(lines, styDim.Render(strings.Repeat("▔", m.width)), m.gradientHeader(title), styDim.Render(strings.Repeat("▔", m.width)))
 
 	// group active panels into rows that fit the width
 	var rows [][]*panel
@@ -350,7 +424,7 @@ func (m *model) render() []string {
 		for i, p := range row {
 			focused := fi == m.focus
 			fi++
-			cols[i] = drawPanel(p, focused)
+			cols[i] = drawPanel(p, focused, m.frame)
 			if len(cols[i]) > maxh {
 				maxh = len(cols[i])
 			}
@@ -373,10 +447,10 @@ func (m *model) render() []string {
 	return lines
 }
 
-func drawPanel(p *panel, focused bool) []string {
+func drawPanel(p *panel, focused bool, frame int) []string {
 	body := styPanel
 	if focused {
-		body = styFocus
+		body = focusStyle(frame)
 	}
 	mark := " "
 	if focused {
@@ -386,7 +460,7 @@ func drawPanel(p *panel, focused bool) []string {
 	top := "┌" + title + strings.Repeat("─", max(0, p.w-2-len(title))) + "┐"
 	lines := []string{top}
 	for i := 1; i < p.h-1; i++ {
-		lines = append(lines, body.Render("│"+center(p.fill, p.w-2)+"│"))
+		lines = append(lines, body.Render("│"+shimmerFill(p.fill, p.w-2, frame)+"│"))
 	}
 	lines = append(lines, styDim.Render("└"+strings.Repeat("─", p.w-2)+"┘"))
 	return lines
