@@ -2,19 +2,21 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 
-	"github.com/charmbracelet/lipgloss"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // Default palette: cool blues/teals/lavender (Tokyo-Night-inspired).
 // No orange anywhere by default.
 var (
 	cHeader  = lipgloss.Color("#7aa2f7") // blue
-	cAccent  = lipgloss.Color("#7dcfff") // light blue
 	cPanel   = lipgloss.Color("#9ece6a") // green
 	cFocus   = lipgloss.Color("#bb9af7") // lavender
 	cDim     = lipgloss.Color("#565f89") // muted
@@ -22,7 +24,6 @@ var (
 	cSuccess = lipgloss.Color("#73daca") // teal
 
 	styHeader = lipgloss.NewStyle().Foreground(cHeader).Bold(true)
-	styAccent = lipgloss.NewStyle().Foreground(cAccent)
 	styPanel  = lipgloss.NewStyle().Foreground(cPanel)
 	styFocus  = lipgloss.NewStyle().Foreground(cFocus).Bold(true)
 	styDim    = lipgloss.NewStyle().Foreground(cDim)
@@ -47,6 +48,14 @@ const (
 	modeToggles
 )
 
+type tickMsg struct{}
+
+type windowSizeMsg struct{ w, h int }
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Second/18, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
 type model struct {
 	panels  []*panel
 	preset  int
@@ -57,6 +66,7 @@ type model struct {
 	names   []string // preset names
 	presets [][]string
 	saved   int
+	frame   int // animation frame counter
 }
 
 var presetDefs = []struct {
@@ -154,20 +164,27 @@ func (m *model) active() []*panel {
 	return out
 }
 
-func (m *model) Init() tea.Cmd { return nil }
+func (m *model) Init() tea.Cmd { return tickCmd() }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		// Fit the layout to the terminal: cap the panel row width so
+		// nothing wraps. The header/input use m.width; clamp it here.
+		if msg.Width > 0 && m.width > msg.Width-2 {
+			m.width = msg.Width - 2
+		}
+		return m, nil
+	case tickMsg:
+		m.frame++
+		return m, tickCmd()
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "tab":
 			if m.mode == modeLayout {
-				act := m.active()
-				if len(act) > 0 {
-					m.focus = (m.focus + 1) % len(act)
-				}
+				m.focusNext()
 			} else {
 				m.mode = modeLayout
 				m.status = ""
@@ -196,11 +213,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "enter", " ":
 			if m.mode == modeToggles {
-				for i, p := range m.panels {
+				for _, p := range m.panels {
 					if p.focus {
 						p.on = !p.on
 						m.status = fmt.Sprintf("%s %s", p.name, onOff(p.on))
-						_ = i
 					}
 				}
 			}
@@ -224,10 +240,32 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.status = fmt.Sprintf("%s %s", p.name, onOff(p.on))
 					}
 				}
+				m.clampFocus()
 			}
 		}
 	}
 	return m, nil
+}
+
+// focusNext moves focus to the next active panel, wrapping.
+func (m *model) focusNext() {
+	act := m.active()
+	if len(act) == 0 {
+		return
+	}
+	m.focus = (m.focus + 1) % len(act)
+}
+
+// clampFocus keeps focus within the active panel list after panels are
+// toggled off; otherwise the focus marker silently disappears.
+func (m *model) clampFocus() {
+	n := len(m.active())
+	if n == 0 {
+		return
+	}
+	if m.focus >= n {
+		m.focus = n - 1
+	}
 }
 
 func onOff(b bool) string {
@@ -265,8 +303,10 @@ func (m *model) save() string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "flocode mock layout — control panel export %d\n", n)
-	b.WriteString(strings.Join(m.render(), "\n"))
-	b.WriteString("\n")
+	for _, line := range m.render() {
+		b.WriteString(stripANSI(line))
+		b.WriteString("\n")
+	}
 	path := filepath.Join(dir, fmt.Sprintf("layout-%02d.txt", n))
 	if err := os.WriteFile(path, []byte(b.String()), 0644); err != nil {
 		return "save failed: " + err.Error()
@@ -274,6 +314,11 @@ func (m *model) save() string {
 	m.saved++
 	return "saved " + path
 }
+
+// stripANSI removes ANSI escape sequences so saved layouts are plain text.
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func stripANSI(s string) string { return ansiRe.ReplaceAllString(s, "") }
 
 func (m *model) View() string {
 	var b strings.Builder
@@ -320,11 +365,138 @@ func (m *model) togglesView() string {
 	return b.String()
 }
 
+// The header gradient sweeps the cool band of the hue wheel — teal →
+// blue → lavender (HSV 170°–290°) — so it never enters the warm/orange
+// region. The sweep ping-pongs (mirrors at the wrap) so the flow never
+// jumps, and the phase advances 1/64 of the span per frame (~3.5s per
+// full sweep at 18fps).
+const (
+	hueMin = 170.0
+	hueMax = 290.0
+)
+
+// sweepHue maps a normalized position t (0..1 across the band) plus the
+// frame phase to a hue, mirrored so the sweep flows back and forth.
+func (m *model) sweepHue(t float64) float64 {
+	span := hueMax - hueMin
+	phase := float64(m.frame) / 64.0
+	u := math.Mod(t+phase, 2.0)
+	if u > 1.0 {
+		u = 2.0 - u
+	}
+	return hueMin + u*span
+}
+
+// gradientHeader renders the title as a smooth traveling hue gradient with
+// a subtle brightness wave riding on top, so two frequencies of motion
+// flow across the text at once.
+func (m *model) gradientHeader(title string) string {
+	centered := center(title, m.width)
+	runes := []rune(centered)
+	n := len(runes)
+	var b strings.Builder
+	for i, r := range runes {
+		t := float64(i) / float64(max(1, n-1))
+		hue := m.sweepHue(t)
+		wave := 0.10 * math.Sin(2*math.Pi*(t*2.0+float64(m.frame)/32.0))
+		v := 0.90 + wave
+		c := hsvToHex(hue, 0.72, v)
+		b.WriteString(lipgloss.NewStyle().Foreground(c).Bold(true).Render(string(r)))
+	}
+	return b.String()
+}
+
+// gradientRule renders a horizontal rule as a dimmer gradient sharing the
+// title's sweep, so the whole header band flows as one piece.
+func (m *model) gradientRule(mark string) string {
+	var b strings.Builder
+	for i := 0; i < m.width; i++ {
+		t := float64(i) / float64(max(1, m.width-1))
+		c := hsvToHex(m.sweepHue(t), 0.45, 0.60)
+		b.WriteString(lipgloss.NewStyle().Foreground(c).Render(mark))
+	}
+	return b.String()
+}
+
+// hsvToHex converts HSV (h in degrees, s/v in 0..1) to a hex color.
+func hsvToHex(h, s, v float64) lipgloss.Color {
+	hp := math.Mod(h, 360.0) / 60.0
+	i := int(math.Floor(hp))
+	f := hp - float64(i)
+	p := v * (1 - s)
+	q := v * (1 - s*f)
+	t := v * (1 - s*(1-f))
+	var r, g, b float64
+	switch i % 6 {
+	case 0:
+		r, g, b = v, t, p
+	case 1:
+		r, g, b = q, v, p
+	case 2:
+		r, g, b = p, v, t
+	case 3:
+		r, g, b = p, q, v
+	case 4:
+		r, g, b = t, p, v
+	case 5:
+		r, g, b = v, p, q
+	}
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", uint8(r*255), uint8(g*255), uint8(b*255)))
+}
+
+// pulse interpolates between two colors over a sine-like cycle.
+func pulse(frame int, period int) float64 {
+	ph := float64(frame%period) / float64(period) * 2 * math.Pi
+	return (1 + math.Sin(ph)) / 2 // 0..1
+}
+
+// focusStyle returns the body style for a focused panel, breathing between
+// lavender and white.
+func focusStyle(frame int) lipgloss.Style {
+	t := pulse(frame, 36)
+	c := lerpColor(cFocus, lipgloss.Color("#ffffff"), t)
+	return lipgloss.NewStyle().Foreground(c).Bold(true)
+}
+
+// lerpColor linearly interpolates two hex colors.
+func lerpColor(a, b lipgloss.Color, t float64) lipgloss.Color {
+	pa, pb := hexToRGB(string(a)), hexToRGB(string(b))
+	r := uint8(float64(pa[0]) + t*(float64(pb[0])-float64(pa[0])))
+	g := uint8(float64(pa[1]) + t*(float64(pb[1])-float64(pa[1])))
+	bch := uint8(float64(pa[2]) + t*(float64(pb[2])-float64(pa[2])))
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", r, g, bch))
+}
+
+func hexToRGB(h string) [3]int {
+	var r, g, b int
+	fmt.Sscanf(h, "#%02x%02x%02x", &r, &g, &b)
+	return [3]int{r, g, b}
+}
+
+// shimmerFill produces a moving highlight band across the panel body text.
+func shimmerFill(fill string, w, frame int) string {
+	s := center(fill, w)
+	runes := []rune(s)
+	pos := frame % (w + 8)
+	var b strings.Builder
+	for i, r := range runes {
+		d := pos - i
+		if d >= 0 && d < 5 {
+			// bright band trailing off
+			c := lerpColor(cText, lipgloss.Color("#ffffff"), 1-float64(d)/5)
+			b.WriteString(lipgloss.NewStyle().Foreground(c).Render(string(r)))
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func (m *model) render() []string {
 	act := m.active()
 	var lines []string
 	title := fmt.Sprintf("flocode — %s", m.names[m.preset])
-	lines = append(lines, styDim.Render(strings.Repeat("▔", m.width)), styHeader.Render(center(title, m.width)), styDim.Render(strings.Repeat("▔", m.width)))
+	lines = append(lines, m.gradientRule("▔"), m.gradientHeader(title), m.gradientRule("▔"))
 
 	// group active panels into rows that fit the width
 	var rows [][]*panel
@@ -350,7 +522,7 @@ func (m *model) render() []string {
 		for i, p := range row {
 			focused := fi == m.focus
 			fi++
-			cols[i] = drawPanel(p, focused)
+			cols[i] = drawPanel(p, focused, m.frame)
 			if len(cols[i]) > maxh {
 				maxh = len(cols[i])
 			}
@@ -373,31 +545,40 @@ func (m *model) render() []string {
 	return lines
 }
 
-func drawPanel(p *panel, focused bool) []string {
+func drawPanel(p *panel, focused bool, frame int) []string {
 	body := styPanel
 	if focused {
-		body = styFocus
+		body = focusStyle(frame)
 	}
 	mark := " "
 	if focused {
 		mark = "*"
 	}
 	title := mark + p.name + mark
-	top := "┌" + title + strings.Repeat("─", max(0, p.w-2-len(title))) + "┐"
+	top := "┌" + title + strings.Repeat("─", max(0, p.w-2-displayWidth(title))) + "┐"
 	lines := []string{top}
 	for i := 1; i < p.h-1; i++ {
-		lines = append(lines, body.Render("│"+center(p.fill, p.w-2)+"│"))
+		lines = append(lines, body.Render("│"+shimmerFill(p.fill, p.w-2, frame)+"│"))
 	}
 	lines = append(lines, styDim.Render("└"+strings.Repeat("─", p.w-2)+"┘"))
 	return lines
 }
 
+// displayWidth returns the number of display cells a string occupies
+// (runes; adequate for the box-drawing chars used here).
+func displayWidth(s string) int { return len([]rune(s)) }
+
+// center pads s to exactly w display cells, rune-safe.
 func center(s string, w int) string {
-	if len(s) >= w {
-		return s[:w]
+	r := []rune(s)
+	if len(r) >= w {
+		if len(r) == w {
+			return s
+		}
+		return string(r[:w])
 	}
-	l := (w - len(s)) / 2
-	return strings.Repeat(" ", l) + s + strings.Repeat(" ", w-l-len(s))
+	l := (w - len(r)) / 2
+	return strings.Repeat(" ", l) + s + strings.Repeat(" ", w-l-len(r))
 }
 
 func max(a, b int) int {
