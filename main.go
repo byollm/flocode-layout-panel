@@ -332,18 +332,83 @@ func (m *model) togglesView() string {
 	return b.String()
 }
 
-// gradientHeader renders the title as a traveling rainbow gradient whose
-// phase advances with the frame counter.
+// The header gradient sweeps the cool band of the hue wheel — teal →
+// blue → lavender (HSV 170°–290°) — so it never enters the warm/orange
+// region. The sweep ping-pongs (mirrors at the wrap) so the flow never
+// jumps, and the phase advances 1/64 of the span per frame (~3.5s per
+// full sweep at 18fps).
+const (
+	hueMin = 170.0
+	hueMax = 290.0
+)
+
+// sweepHue maps a normalized position t (0..1 across the band) plus the
+// frame phase to a hue, mirrored so the sweep flows back and forth.
+func (m *model) sweepHue(t float64) float64 {
+	span := hueMax - hueMin
+	phase := float64(m.frame) / 64.0
+	u := math.Mod(t+phase, 2.0)
+	if u > 1.0 {
+		u = 2.0 - u
+	}
+	return hueMin + u*span
+}
+
+// gradientHeader renders the title as a smooth traveling hue gradient with
+// a subtle brightness wave riding on top, so two frequencies of motion
+// flow across the text at once.
 func (m *model) gradientHeader(title string) string {
-	palette := []lipgloss.Color{cHeader, cAccent, cSuccess, cFocus, cText}
 	centered := center(title, m.width)
 	runes := []rune(centered)
+	n := len(runes)
 	var b strings.Builder
 	for i, r := range runes {
-		c := palette[(i+m.frame)%len(palette)]
+		t := float64(i) / float64(max(1, n-1))
+		hue := m.sweepHue(t)
+		wave := 0.10 * math.Sin(2*math.Pi*(t*2.0+float64(m.frame)/32.0))
+		v := 0.90 + wave
+		c := hsvToHex(hue, 0.72, v)
 		b.WriteString(lipgloss.NewStyle().Foreground(c).Bold(true).Render(string(r)))
 	}
 	return b.String()
+}
+
+// gradientRule renders a horizontal rule as a dimmer gradient sharing the
+// title's sweep, so the whole header band flows as one piece.
+func (m *model) gradientRule(mark string) string {
+	var b strings.Builder
+	for i := 0; i < m.width; i++ {
+		t := float64(i) / float64(max(1, m.width-1))
+		c := hsvToHex(m.sweepHue(t), 0.45, 0.60)
+		b.WriteString(lipgloss.NewStyle().Foreground(c).Render(mark))
+	}
+	return b.String()
+}
+
+// hsvToHex converts HSV (h in degrees, s/v in 0..1) to a hex color.
+func hsvToHex(h, s, v float64) lipgloss.Color {
+	hp := math.Mod(h, 360.0) / 60.0
+	i := int(math.Floor(hp))
+	f := hp - float64(i)
+	p := v * (1 - s)
+	q := v * (1 - s*f)
+	t := v * (1 - s*(1-f))
+	var r, g, b float64
+	switch i % 6 {
+	case 0:
+		r, g, b = v, t, p
+	case 1:
+		r, g, b = q, v, p
+	case 2:
+		r, g, b = p, v, t
+	case 3:
+		r, g, b = p, q, v
+	case 4:
+		r, g, b = t, p, v
+	case 5:
+		r, g, b = v, p, q
+	}
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", uint8(r*255), uint8(g*255), uint8(b*255)))
 }
 
 // pulse interpolates between two colors over a sine-like cycle.
@@ -398,7 +463,7 @@ func (m *model) render() []string {
 	act := m.active()
 	var lines []string
 	title := fmt.Sprintf("flocode — %s", m.names[m.preset])
-	lines = append(lines, styDim.Render(strings.Repeat("▔", m.width)), m.gradientHeader(title), styDim.Render(strings.Repeat("▔", m.width)))
+	lines = append(lines, m.gradientRule("▔"), m.gradientHeader(title), m.gradientRule("▔"))
 
 	// group active panels into rows that fit the width
 	var rows [][]*panel
