@@ -50,8 +50,6 @@ const (
 
 type tickMsg struct{}
 
-type windowSizeMsg struct{ w, h int }
-
 func tickCmd() tea.Cmd {
 	return tea.Tick(time.Second/18, func(time.Time) tea.Msg { return tickMsg{} })
 }
@@ -60,12 +58,12 @@ type model struct {
 	panels  []*panel
 	preset  int
 	width   int
+	minW    int // smallest terminal width seen (floor for clamping)
 	focus   int // focused panel index in layout (left-to-right)
 	mode    mode
 	status  string
 	names   []string // preset names
 	presets [][]string
-	saved   int
 	frame   int // animation frame counter
 }
 
@@ -139,19 +137,26 @@ func (m *model) applyPreset(i int) {
 		p.on = false
 	}
 	for _, name := range m.presets[i] {
-		m.byName(name).on = true
+		p, err := m.byName(name)
+		if err != nil {
+			// A preset names a panel that doesn't exist — surface it instead
+			// of silently enabling the wrong panel.
+			m.status = "preset error: " + err.Error()
+			return
+		}
+		p.on = true
 	}
 	m.preset = i
 	m.focus = 0
 }
 
-func (m *model) byName(n string) *panel {
+func (m *model) byName(n string) (*panel, error) {
 	for _, p := range m.panels {
 		if p.name == n {
-			return p
+			return p, nil
 		}
 	}
-	return m.panels[0]
+	return nil, fmt.Errorf("no panel %q", n)
 }
 
 func (m *model) active() []*panel {
@@ -169,15 +174,34 @@ func (m *model) Init() tea.Cmd { return tickCmd() }
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		// Fit the layout to the terminal: cap the panel row width so
-		// nothing wraps. The header/input use m.width; clamp it here.
-		if msg.Width > 0 && m.width > msg.Width-2 {
-			m.width = msg.Width - 2
+		// Fit the layout to the terminal. Track the smallest width seen so
+		// we clamp in both directions: shrink to fit narrow terminals and
+		// recover (grow back) when the terminal widens again.
+		if msg.Width > 0 {
+			if m.minW == 0 || msg.Width < m.minW {
+				m.minW = msg.Width
+			}
+			// width is a user-tunable preference (via 'w'); clamp it to the
+			// terminal, but never below the smallest width we've seen.
+			w := msg.Width - 2
+			if m.width > w {
+				m.width = w
+			}
+			if m.width < m.minW-2 && m.width < 60 {
+				m.width = m.minW - 2
+			}
 		}
 		return m, nil
 	case tickMsg:
 		m.frame++
 		return m, tickCmd()
+	case saveResultMsg:
+		if msg.err != nil {
+			m.status = "save failed: " + msg.err.Error()
+		} else {
+			m.status = "saved " + msg.path
+		}
+		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -209,7 +233,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "S":
 			if m.mode == modeLayout {
-				m.status = m.save()
+				m.status = "saving…"
+				return m, m.saveLayout()
 			}
 		case "enter", " ":
 			if m.mode == modeToggles {
@@ -219,6 +244,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.status = fmt.Sprintf("%s %s", p.name, onOff(p.on))
 					}
 				}
+				m.clampFocus()
+				m.syncToggleCursor()
 			}
 		case "down", "j":
 			if m.mode == modeToggles {
@@ -230,6 +257,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "T":
 			m.mode = modeToggles
+			m.syncToggleCursor()
 			m.status = "toggles: ↑↓ move, space toggle, tab back"
 		default:
 			// single-letter panel toggles work in both modes
@@ -287,32 +315,75 @@ func (m *model) moveToggle(d int) {
 	m.panels[0].focus = true
 }
 
-func (m *model) save() string {
-	dir := "/tmp/mf"
-	os.MkdirAll(dir, 0755)
-	// find next free layout number
-	n := 1
-	for {
-		if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("layout-%02d.txt", n))); err != nil {
-			break
+// syncToggleCursor aligns the toggles-mode cursor (p.focus) with the
+// layout-mode focus (m.focus) so the two modes don't desync. It marks the
+// active panel at m.focus as focused, falling back to the first active panel
+// (or none) if the index is out of range.
+func (m *model) syncToggleCursor() {
+	for _, p := range m.panels {
+		p.focus = false
+	}
+	act := m.active()
+	if len(act) == 0 {
+		return
+	}
+	if m.focus < 0 || m.focus >= len(act) {
+		m.focus = 0
+	}
+	act[m.focus].focus = true
+}
+
+// saveLayout returns a tea.Cmd that writes the current layout to a file in
+// the user's cache dir. It runs off the event loop so the TUI never blocks
+// on disk I/O, and uses O_EXCL so it can never follow a symlink or overwrite
+// an existing file (no TOCTOU).
+func (m *model) saveLayout() tea.Cmd {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return func() tea.Msg { return saveResultMsg{err: err} }
+	}
+	dir = filepath.Join(dir, "flocode-layout-panel")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return func() tea.Msg { return saveResultMsg{err: err} }
+	}
+	// Snapshot the layout now (on the event loop) so the goroutine doesn't
+	// read mutable model state concurrently.
+	lines := m.render()
+	return func() tea.Msg {
+		var b strings.Builder
+		for _, line := range lines {
+			b.WriteString(stripANSI(line))
+			b.WriteString("\n")
 		}
-		n++
+		// find next free layout number
+		n := 1
+		for n <= 99 {
+			path := filepath.Join(dir, fmt.Sprintf("layout-%02d.txt", n))
+			f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+			if err == nil {
+				_, werr := f.WriteString(b.String())
+				cerr := f.Close()
+				if werr != nil {
+					return saveResultMsg{err: werr}
+				}
+				if cerr != nil {
+					return saveResultMsg{err: cerr}
+				}
+				return saveResultMsg{path: path}
+			}
+			if !os.IsExist(err) {
+				return saveResultMsg{err: err}
+			}
+			n++
+		}
+		return saveResultMsg{err: fmt.Errorf("no free layout slot (1-99)")}
 	}
-	if n > 99 {
-		return "no free layout slot"
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "flocode mock layout — control panel export %d\n", n)
-	for _, line := range m.render() {
-		b.WriteString(stripANSI(line))
-		b.WriteString("\n")
-	}
-	path := filepath.Join(dir, fmt.Sprintf("layout-%02d.txt", n))
-	if err := os.WriteFile(path, []byte(b.String()), 0644); err != nil {
-		return "save failed: " + err.Error()
-	}
-	m.saved++
-	return "saved " + path
+}
+
+// saveResultMsg reports the outcome of an async layout save.
+type saveResultMsg struct {
+	path string
+	err  error
 }
 
 // stripANSI removes ANSI escape sequences so saved layouts are plain text.
