@@ -54,6 +54,14 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(time.Second/18, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
+// Width bounds for the layout. maxWidth caps manual 'w' growth; minWidth is
+// the reasonable floor for wide terminals — narrow terminals are allowed to
+// go below it so panels actually fit on screen.
+const (
+	minWidth = 60
+	maxWidth = 160
+)
+
 type model struct {
 	panels  []*panel
 	preset  int
@@ -62,9 +70,12 @@ type model struct {
 	focus   int // focused panel index in layout (left-to-right)
 	mode    mode
 	status  string
+	saveDir string   // optional override for tests; empty = user cache dir
 	names   []string // preset names
 	presets [][]string
-	frame   int // animation frame counter
+
+	frame int // animation frame counter
+
 }
 
 var presetDefs = []struct {
@@ -175,20 +186,28 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		// Fit the layout to the terminal. Track the smallest width seen so
-		// we clamp in both directions: shrink to fit narrow terminals and
-		// recover (grow back) when the terminal widens again.
+		// we can recover when a narrow terminal widens again.
 		if msg.Width > 0 {
 			if m.minW == 0 || msg.Width < m.minW {
 				m.minW = msg.Width
 			}
-			// width is a user-tunable preference (via 'w'); clamp it to the
-			// terminal, but never below the smallest width we've seen.
-			w := msg.Width - 2
-			if m.width > w {
-				m.width = w
-			}
-			if m.width < m.minW-2 && m.width < 60 {
-				m.width = m.minW - 2
+			maxFit := msg.Width - 2
+			switch {
+			case maxFit < minWidth:
+				// Narrow terminal: fit exactly — no artificial floor that
+				// would overflow the screen.
+				if m.width > maxFit {
+					m.width = maxFit
+				}
+			default:
+				// Wide enough for the standard floor: keep at least
+				// minWidth once there's room, but never exceed what fits.
+				if m.width > maxFit {
+					m.width = maxFit
+				}
+				if m.width < minWidth {
+					m.width = minWidth
+				}
 			}
 		}
 		return m, nil
@@ -226,8 +245,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "w":
 			if m.mode == modeLayout {
 				m.width += 12
-				if m.width > 160 {
-					m.width = 60
+				if m.width > maxWidth {
+					m.width = minWidth
+				}
+				// Never let manual growth overflow the known terminal size.
+				if term := m.minW - 2; term > 0 && m.width > term {
+					m.width = term
 				}
 				m.status = fmt.Sprintf("width %d", m.width)
 			}
@@ -245,7 +268,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.clampFocus()
-				m.syncToggleCursor()
 			}
 		case "down", "j":
 			if m.mode == modeToggles {
@@ -260,7 +282,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.syncToggleCursor()
 			m.status = "toggles: ↑↓ move, space toggle, tab back"
 		default:
-			// single-letter panel toggles work in both modes
 			if len(msg.String()) == 1 {
 				for _, p := range m.panels {
 					if p.key == msg.String() {
@@ -269,6 +290,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.clampFocus()
+				m.syncToggleCursor()
 			}
 		}
 	}
@@ -336,11 +358,16 @@ func (m *model) syncToggleCursor() {
 // saveLayout returns a tea.Cmd that writes the current layout to a file in
 // the user's cache dir. It runs off the event loop so the TUI never blocks
 // on disk I/O, and uses O_EXCL so it can never follow a symlink or overwrite
-// an existing file (no TOCTOU).
+// an existing file (no TOCTOU). The save dir can be overridden for tests via
+// m.saveDir so tests never write to the real user cache.
 func (m *model) saveLayout() tea.Cmd {
-	dir, err := os.UserCacheDir()
-	if err != nil {
-		return func() tea.Msg { return saveResultMsg{err: err} }
+	dir := m.saveDir
+	if dir == "" {
+		var err error
+		dir, err = os.UserCacheDir()
+		if err != nil {
+			return func() tea.Msg { return saveResultMsg{err: err} }
+		}
 	}
 	dir = filepath.Join(dir, "flocode-layout-panel")
 	if err := os.MkdirAll(dir, 0700); err != nil {

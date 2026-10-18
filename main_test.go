@@ -194,44 +194,42 @@ func TestRowPacking(t *testing.T) {
 }
 
 // TestSaveLayoutSecurity verifies the async save uses O_EXCL (never follows a
-// symlink / never overwrites) and writes to a per-user dir.
+// symlink / never overwrites), writes under flocode-layout-panel, and never
+// touches world-writable /tmp/mf or the real user cache dir.
 func TestSaveLayoutSecurity(t *testing.T) {
+	t.Parallel()
+
 	m := newModel()
 	m.width = 80
-
-	saved := false
-	var gotPath string
-	var gotErr error
+	m.saveDir = t.TempDir() // inject a temp dir so we never touch the real user cache
 
 	saveCmd := m.saveLayout()
 	if saveCmd == nil {
 		t.Fatal("saveLayout returned nil cmd")
 	}
 	res := saveCmd()
-	if msg, ok := res.(saveResultMsg); ok {
-		if msg.err != nil {
-			t.Fatalf("save failed: %v", msg.err)
-		}
-		saved = true
-		gotPath = msg.path
+	msg, ok := res.(saveResultMsg)
+	if !ok {
+		t.Fatalf("saveLayout returned %T, want saveResultMsg", res)
 	}
+	if msg.err != nil {
+		t.Fatalf("save failed: %v", msg.err)
+	}
+	gotPath := msg.path
 
-	if !saved {
-		t.Fatal("save did not complete")
-	}
-	if !strings.Contains(gotPath, "flocode-layout-panel") {
-		t.Errorf("save path %q not under per-user flocode-layout-panel dir", gotPath)
-	}
 	if strings.Contains(gotPath, "/tmp/mf") {
 		t.Errorf("save path %q still uses world-writable /tmp/mf", gotPath)
+	}
+	if !strings.HasPrefix(gotPath, m.saveDir) {
+		t.Errorf("save path %q not under injected saveDir %q", gotPath, m.saveDir)
+	}
+	if !strings.Contains(gotPath, "flocode-layout-panel") {
+		t.Errorf("save path %q not under flocode-layout-panel dir", gotPath)
 	}
 
 	// Second save with same content must pick a NEW slot (O_EXCL), never overwrite.
 	res2 := saveCmd()
 	if msg2, ok := res2.(saveResultMsg); ok && msg2.err == nil && msg2.path == gotPath {
 		t.Errorf("second save reused path %q; O_EXCL should force a new slot", gotPath)
-	}
-	if err := gotErr; err != nil {
-		t.Errorf("unexpected error: %v", err)
 	}
 }
